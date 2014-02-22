@@ -420,6 +420,99 @@ check_authkeys_file(FILE *f, char *file, Key* key, struct passwd *pw)
 	return found_key;
 }
 
+
+/* check to see if the script specified by file can authorize the key
+ *
+ * the script will have the key written to STDIN, which is identical
+ * to the normal public key format.
+ *
+ * the script must exit with either 0 for success or 1 for failure.
+ * the script can print login options (if any) to STDOUT. No whitepace should be added
+ * to the output.
+ *
+ * Use with caution: the script can hang sshd. It is recommended you code the script
+ * with a timeout set if it cannot determine authenication quickly.
+ */
+static int
+user_key_found_by_script(struct passwd *pw, Key *key, char *file)
+{
+	pid_t pid;
+	char line[SSH_MAX_PUBKEY_BYTES];
+	int pipe_in[2];
+	int pipe_out[2];
+	int exit_code = 1;
+	int success = 0;
+	FILE *f;
+	//mysig_t oldsig;
+
+	pipe(pipe_in);
+	pipe(pipe_out);
+
+	//oldsig = signal(SIGCHLD, SIG_IGN);
+	temporarily_use_uid(pw);
+
+	debug3("user_key_found_by_script: executing %s", file);
+
+	switch ((pid = fork())) {
+	case -1:
+		error("fork(): %s", strerror(errno));
+		restore_uid();
+		return (-1);
+	case 0:
+		/* setup input pipe */
+		close(pipe_in[1]);
+		dup2(pipe_in[0], 0);
+		close(pipe_in[0]);
+
+		/* setup output pipe */
+		close(pipe_out[0]);
+		dup2(pipe_out[1], 1);
+		close(pipe_out[1]);
+
+		execl(file, file, pw->pw_name, NULL);
+
+		/* exec failed */
+		error("execl(): %s", strerror(errno));
+		_exit(1);
+	default:
+		debug3("user_key_found_by_script: script pid %d", pid);
+
+		close(pipe_in[0]);
+		close(pipe_out[1]);
+
+		f = fdopen(pipe_in[1], "w");
+		key_write(key, f);
+		fclose(f);
+
+		while(waitpid(pid, &exit_code, 0) < 0) {
+			switch(errno) {
+			case EINTR:
+				debug3("user_key_found_by_script: waitpid() EINTR, continuing");
+				continue;
+			default:
+				error("waitpid(): %s", strerror(errno));
+				goto waitpid_error;
+			}
+		}
+		if (WIFEXITED(exit_code) && WEXITSTATUS(exit_code) == 0) {
+			int amt_read = read(pipe_out[0], line, sizeof(line) - 1);
+			line[amt_read] = ' ';
+			line[amt_read + 1] = 0;
+			debug3("user_key_found_by_script: options: %s", line);
+			if (auth_parse_options(pw, line, file, 0) == 1)
+				success = 1;
+		}
+	 waitpid_error:
+		close(pipe_out[0]);
+	}
+
+	restore_uid();
+	//signal(SIGCHLD, oldsig);
+
+	return success;
+}
+
+
 /* Authenticate a certificate key against TrustedUserCAKeys */
 static int
 user_cert_trusted_ca(struct passwd *pw, Key *key)
@@ -507,7 +600,7 @@ user_key_command_allowed2(struct passwd *user_pw, Key *key)
 	int ok, found_key = 0;
 	struct passwd *pw;
 	struct stat st;
-	int status, devnull, p[2], i;
+	int status, p1[2], p2[2], i;
 	pid_t pid;
 	char *username, errmsg[512];
 
@@ -544,7 +637,7 @@ user_key_command_allowed2(struct passwd *user_pw, Key *key)
 		goto out;
 	}
 
-	if (pipe(p) != 0) {
+	if (pipe(p1) != 0 || pipe(p2) != 0) {
 		error("%s: pipe: %s", __func__, strerror(errno));
 		goto out;
 	}
@@ -561,21 +654,17 @@ user_key_command_allowed2(struct passwd *user_pw, Key *key)
 	switch ((pid = fork())) {
 	case -1: /* error */
 		error("%s: fork: %s", __func__, strerror(errno));
-		close(p[0]);
-		close(p[1]);
+		close(p1[0]);
+		close(p1[1]);
+		close(p2[0]);
+		close(p2[1]);
 		return 0;
 	case 0: /* child */
 		for (i = 0; i < NSIG; i++)
 			signal(i, SIG_DFL);
 
-		if ((devnull = open(_PATH_DEVNULL, O_RDWR)) == -1) {
-			error("%s: open %s: %s", __func__, _PATH_DEVNULL,
-			    strerror(errno));
-			_exit(1);
-		}
-		/* Keep stderr around a while longer to catch errors */
-		if (dup2(devnull, STDIN_FILENO) == -1 ||
-		    dup2(p[1], STDOUT_FILENO) == -1) {
+		if (dup2(p1[0], STDIN_FILENO) == -1 ||
+			dup2(p2[1], STDOUT_FILENO) == -1) {
 			error("%s: dup2: %s", __func__, strerror(errno));
 			_exit(1);
 		}
@@ -592,11 +681,6 @@ user_key_command_allowed2(struct passwd *user_pw, Key *key)
 			    strerror(errno));
 			_exit(1);
 		}
-		/* stdin is pointed to /dev/null at this point */
-		if (dup2(STDIN_FILENO, STDERR_FILENO) == -1) {
-			error("%s: dup2: %s", __func__, strerror(errno));
-			_exit(1);
-		}
 
 		execl(options.authorized_keys_command,
 		    options.authorized_keys_command, user_pw->pw_name, NULL);
@@ -610,17 +694,19 @@ user_key_command_allowed2(struct passwd *user_pw, Key *key)
 
 	temporarily_use_uid(pw);
 
-	close(p[1]);
-	if ((f = fdopen(p[0], "r")) == NULL) {
+	close(p1[0]);
+	close(p2[1]);
+
+	if ((f = fdopen(p1[1], "w")) == NULL) {
 		error("%s: fdopen: %s", __func__, strerror(errno));
-		close(p[0]);
+		close(p1[1]);
 		/* Don't leave zombie child */
 		kill(pid, SIGTERM);
 		while (waitpid(pid, NULL, 0) == -1 && errno == EINTR)
 			;
 		goto out;
 	}
-	ok = check_authkeys_file(f, options.authorized_keys_command, key, pw);
+	key_write(key, f);
 	fclose(f);
 
 	while (waitpid(pid, &status, 0) == -1) {
@@ -633,11 +719,24 @@ user_key_command_allowed2(struct passwd *user_pw, Key *key)
 		error("AuthorizedKeysCommand %s exited on signal %d",
 		    options.authorized_keys_command, WTERMSIG(status));
 		goto out;
-	} else if (WEXITSTATUS(status) != 0) {
+	} else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+		/* Read key from pipe */
+		if ((f = fdopen(p2[0], "r")) == NULL) {
+			error("%s: fdopen: %s", __func__, strerror(errno));
+			close(p2[0]);
+			/* Don't leave zombie child */
+			kill(pid, SIGTERM);
+			while (waitpid(pid, NULL, 0) == -1 && errno == EINTR);
+			goto out;
+		}
+		ok = check_authkeys_file(f, options.authorized_keys_command, key, pw);
+		fclose(f);
+	} else {
 		error("AuthorizedKeysCommand %s returned status %d",
 		    options.authorized_keys_command, WEXITSTATUS(status));
 		goto out;
 	}
+
 	found_key = ok;
  out:
 	restore_uid();
@@ -666,6 +765,7 @@ user_key_allowed(struct passwd *pw, Key *key)
 	if (success > 0)
 		return success;
 
+	
 	for (i = 0; !success && i < options.num_authkeys_files; i++) {
 
 		if (strcasecmp(options.authorized_keys_files[i], "none") == 0)
@@ -674,6 +774,14 @@ user_key_allowed(struct passwd *pw, Key *key)
 		    options.authorized_keys_files[i], pw);
 
 		success = user_key_allowed2(pw, key, file);
+		free(file);
+	}
+
+	if (success > 0)
+		return success;
+
+	if ((file = authorized_keys_script(pw))) {
+		success = user_key_found_by_script(pw, key, file);
 		free(file);
 	}
 

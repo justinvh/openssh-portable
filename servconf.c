@@ -140,6 +140,7 @@ initialize_server_options(ServerOptions *options)
 	options->client_alive_interval = -1;
 	options->client_alive_count_max = -1;
 	options->num_authkeys_files = 0;
+    options->authorized_keys_script = NULL;
 	options->num_accept_env = 0;
 	options->permit_tun = -1;
 	options->num_permitted_opens = -1;
@@ -339,7 +340,7 @@ typedef enum {
 	sMaxStartups, sMaxAuthTries, sMaxSessions,
 	sBanner, sUseDNS, sHostbasedAuthentication,
 	sHostbasedUsesNameFromPacketOnly, sClientAliveInterval,
-	sClientAliveCountMax, sAuthorizedKeysFile,
+	sClientAliveCountMax, sAuthorizedKeysFile, sAuthorizedKeysScript,
 	sGssAuthentication, sGssCleanupCreds, sAcceptEnv, sPermitTunnel,
 	sMatch, sPermitOpen, sForceCommand, sChrootDirectory,
 	sUsePrivilegeSeparation, sAllowAgentForwarding,
@@ -456,6 +457,7 @@ static struct {
 	{ "clientalivecountmax", sClientAliveCountMax, SSHCFG_GLOBAL },
 	{ "authorizedkeysfile", sAuthorizedKeysFile, SSHCFG_ALL },
 	{ "authorizedkeysfile2", sDeprecated, SSHCFG_ALL },
+	{ "authorizedkeysscript", sAuthorizedKeysScript, SSHCFG_ALL },
 	{ "useprivilegeseparation", sUsePrivilegeSeparation, SSHCFG_GLOBAL},
 	{ "acceptenv", sAcceptEnv, SSHCFG_ALL },
 	{ "permittunnel", sPermitTunnel, SSHCFG_ALL },
@@ -1432,6 +1434,17 @@ process_server_config_line(ServerOptions *options, char *line,
 		}
 		break;
 
+	case sAuthorizedKeysScript:
+		charptr = &options->authorized_keys_script;
+		arg = strdelim(&cp);
+		if (!arg || *arg == '\0')
+			fatal("%s line %d: missing file name.",
+			    filename, linenum);
+		if (*activep && *charptr == NULL) {
+			*charptr = tilde_expand_filename(arg, getuid());
+		}
+		break;
+
 	case sClientAliveInterval:
 		intptr = &options->client_alive_interval;
 		goto parse_time;
@@ -2033,6 +2046,7 @@ dump_config(ServerOptions *o)
 	    o->authorized_principals_file);
 	dump_cfg_string(sVersionAddendum, o->version_addendum);
 	dump_cfg_string(sAuthorizedKeysCommand, o->authorized_keys_command);
+	dump_cfg_string(sAuthorizedKeysScript, o->authorized_keys_script);
 	dump_cfg_string(sAuthorizedKeysCommandUser, o->authorized_keys_command_user);
 	dump_cfg_string(sHostKeyAgent, o->host_key_agent);
 	dump_cfg_string(sKexAlgorithms, o->kex_algorithms ? o->kex_algorithms :

@@ -53,6 +53,9 @@
 # but this is overridden so installations will only check .ssh/authorized_keys
 AuthorizedKeysFile	.ssh/authorized_keys
 
+# Check a local script to allow certain users
+# AuthorizedKeysScript	.ssh/authorized_keys_script
+
 #AuthorizedPrincipalsFile none
 
 #AuthorizedKeysCommand none
